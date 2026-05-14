@@ -5,5 +5,28 @@
 
 ***
 
+## Installation
+
+```sh
+!pip install midiano
+```
+
+***
+
+## Use as follows
+
+```python
+...
+```
+
+***
+
+## Attribution
+
+* midiano was passionately vibe-coded with [Z AI](https://chat.z.ai/)
+* Artwork is a courtesy of [Microsoft Copilot](https://copilot.microsoft.com/) 
+
+***
+
 ### Project Los Angeles
 ### Tegridy Code 2026
