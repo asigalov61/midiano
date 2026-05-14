@@ -1,0 +1,71 @@
+[build-system]
+requires = ["setuptools>=82.0.0", "wheel", "build"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "midiano"
+version = "26.5.14"
+description = "Comprehensive Python package for MIDI music anomalies detection and features analysis"
+license = "Apache-2.0"
+license-files = ["LICENSE"]
+authors = [
+  { name = "Alex Lev", email = "alexlev61@proton.me" }
+]
+maintainers = [
+  { name = "Alex Lev", email = "alexlev61@proton.me" }
+]
+
+dependencies = [
+  "tqdm",
+  "scikit-learn",
+  "scipy",
+  "numpy==1.26.4"
+]
+
+keywords = [
+  "MIDI",
+  "MIDI analysis",
+  "MIDI anomaly detection",
+  "MIDI problems",
+  "MIDI features",
+  "MIDI detective",
+  "music features",
+  "music information retrieval",
+  "MIR"
+]
+
+classifiers = [
+  "Development Status :: 5 - Production/Stable",
+  "Intended Audience :: Developers",
+  "Intended Audience :: Science/Research",
+  "Intended Audience :: Education",
+  "Operating System :: OS Independent",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3 :: Only",
+  "Programming Language :: Python :: 3.8",
+  "Programming Language :: Python :: 3.9",
+  "Programming Language :: Python :: 3.10",
+  "Programming Language :: Python :: 3.11",
+  "Programming Language :: Python :: 3.12",
+  "Topic :: Multimedia :: Sound/Audio",
+  "Topic :: Multimedia :: Sound/Audio :: MIDI",
+  "Topic :: Scientific/Engineering :: Information Analysis",
+  "Topic :: Software Development :: Libraries :: Python Modules",
+  "Environment :: Console",
+  "Natural Language :: English",
+  "Typing :: Typed"
+]
+
+requires-python = ">=3.8"
+
+[project.readme]
+file = "midiano/README.md"
+content-type = "text/markdown"
+
+[project.urls]
+Homepage = "https://github.com/asigalov61/midiano"
+SoundCloud = "https://soundcloud.com/aleksandr-sigalov-61/"
+Documentation = "https://github.com/asigalov61/midiano"
+Issues = "https://github.com/asigalov61/midiano/issues"
+Discussions = "https://github.com/asigalov61/midiano/discussions"
+Dataset = "https://huggingface.co/datasets/projectlosangeles/Discover-MIDI-Dataset"

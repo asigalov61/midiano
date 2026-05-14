@@ -1,0 +1,4 @@
+include midiano/README.md
+recursive-include midiano/ *
+recursive-include midiano/models *
+recursive-include midiano/artwork *
