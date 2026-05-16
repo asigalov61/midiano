@@ -50,7 +50,7 @@ print('=' * 70)
 ###################################################################################
 ###################################################################################
 
-import MIDI
+from . import MIDI
 import numpy as np
 from scipy import stats
 from collections import Counter, defaultdict
