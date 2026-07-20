@@ -53,12 +53,23 @@ print('=' * 70)
 from . import MIDI
 import numpy as np
 from scipy import stats
-from collections import Counter, defaultdict
+from collections import Counter, defaultdict, deque
 import math
 import os
 import tqdm
 from sklearn.ensemble import IsolationForest
 from sklearn.preprocessing import StandardScaler
+import statistics as stats
+import matplotlib.pyplot as plt
+
+# Optional progress-bar dependency (graceful fallback)
+try:
+    from tqdm.auto import tqdm
+    _HAS_TQDM = True
+except Exception:  # pragma: no cover
+    _HAS_TQDM = False
+    def tqdm(x, **kwargs):
+        return x
 
 ###################################################################################
 
@@ -1813,10 +1824,740 @@ def generate_analysis_report(analysis):
 
 ###################################################################################
 
+# =============================================================================
+# High-precision MIDI timing anomaly detector
+# Voice-aware + grid-residual based. Adapted for expressive human performances.
+# =============================================================================
+
+# =============================================================================
+# Tempo map construction
+# =============================================================================
+def build_tempo_map(score, verbose=False, show_progress_bar=False):
+    """Extract a de-duplicated, sorted list of (tick, tempo_us) tempo changes.
+
+    Walks every track of a parsed MIDI score and collects `set_tempo` events.
+    If none are present, defaults to 500000 µs/quarter (120 BPM). The first
+    event is forced to occur at tick 0 so subsequent tick→ms conversion has a
+    valid anchor for any note in the file.
+
+    Parameters
+    ----------
+    score : list
+        Score list as returned by `MIDI.midi2score`. Index 0 holds
+        `ticks_per_quarter`; subsequent indices are per-track event lists.
+    verbose : bool, default False
+        If True, prints the number of tempo changes discovered and the
+        equivalent BPM range.
+    show_progress_bar : bool, default False
+        If True, wraps the per-track iteration with a `tqdm` progress bar.
+
+    Returns
+    -------
+    list[tuple[int, int]]
+        Sorted, de-duplicated list of `(tick, tempo_microseconds)` pairs,
+        guaranteed to start at tick 0.
+    """
+    tempo_changes = []
+    tracks = range(1, len(score))
+    if show_progress_bar:
+        tracks = tqdm(tracks, desc="Scanning tempo map", leave=False)
+    for itrack in tracks:
+        for ev in score[itrack]:
+            if ev[0] == 'set_tempo':
+                tempo_changes.append((ev[1], ev[2]))
+
+    if not tempo_changes:
+        tempo_changes = [(0, 500000)]
+    tempo_changes.sort(key=lambda x: x[0])
+
+    # Anchor at tick 0
+    if tempo_changes[0][0] > 0:
+        tempo_changes.insert(0, (0, tempo_changes[0][1]))
+
+    # De-duplicate by tick (keep first occurrence)
+    seen, deduped = set(), []
+    for t, tp in tempo_changes:
+        if t not in seen:
+            seen.add(t)
+            deduped.append((t, tp))
+
+    if verbose:
+        bpms = [60_000_000 / tp for _, tp in deduped]
+        print(f"[tempo] {len(deduped)} tempo change(s); "
+              f"BPM range {min(bpms):.2f}–{max(bpms):.2f}")
+    return deduped
+
+
+def ticks_to_ms_function(tempo_changes, ticks_per_quarter):
+    """Build a closure mapping MIDI ticks to absolute time in milliseconds.
+
+    Precomputes per-segment cumulative millisecond offsets, then performs a
+    binary search at call time to find the active tempo segment and add the
+    proportional intra-segment contribution.
+
+    Parameters
+    ----------
+    tempo_changes : list[tuple[int, int]]
+        Sorted `(tick, tempo_us)` pairs from `build_tempo_map`.
+    ticks_per_quarter : int
+        PPQ resolution from the MIDI header.
+
+    Returns
+    -------
+    callable
+        `f(tick: int) -> float` returning milliseconds since the start.
+    """
+    boundaries, cum_ms = [], 0.0
+    for i, (tick, tempo_us) in enumerate(tempo_changes):
+        boundaries.append({'tick': tick, 'tempo_us': tempo_us, 'cum_ms': cum_ms})
+        if i + 1 < len(tempo_changes):
+            delta_ticks = tempo_changes[i + 1][0] - tick
+            cum_ms += delta_ticks * (tempo_us / 1000.0) / ticks_per_quarter
+
+    def f(tick_query):
+        lo, hi = 0, len(boundaries) - 1
+        while lo <= hi:
+            mid = (lo + hi) // 2
+            if boundaries[mid]['tick'] <= tick_query:
+                lo = mid + 1
+            else:
+                hi = mid - 1
+        seg = boundaries[max(0, hi)]
+        delta = tick_query - seg['tick']
+        return seg['cum_ms'] + delta * (seg['tempo_us'] / 1000.0) / ticks_per_quarter
+
+    return f
+
+
+def robust_mad(data):
+    """Median Absolute Deviation scaled to be ~consistent with std-deviation.
+
+    Uses the standard 1.4826 consistency constant for Gaussian data. Returns
+    0.0 for empty input.
+
+    Parameters
+    ----------
+    data : iterable[float]
+        Numeric samples.
+
+    Returns
+    -------
+    float
+        Scaled MAD (≥ 0).
+    """
+    if not data:
+        return 0.0
+    med = stats.median(data)
+    return stats.median([abs(x - med) for x in data]) * 1.4826
+
+
+# =============================================================================
+# Subdivision estimation
+# =============================================================================
+def estimate_subdivision(ioi_values_ms, quarter_ms,
+                         candidates=(1, 2, 3, 4, 6, 8, 12, 16)):
+    """Pick the subdivision whose grid best explains the IOI distribution.
+
+    For each candidate `s` we form a grid `quarter_ms / s`, then check what
+    fraction of IOIs are close to an integer multiple of that grid. A small
+    prior bonus is given to conventional subdivisions (4, 8, 16) to avoid
+    spurious choices on very rubato material. If no candidate reaches a
+    satisfactory fit, the function falls back to 4 subdivisions per quarter.
+
+    Parameters
+    ----------
+    ioi_values_ms : iterable[float]
+        All IOIs (in ms) across voices; values ≤ 5 ms are discarded.
+    quarter_ms : float
+        Duration of one quarter note in ms (evaluated at the initial tempo).
+    candidates : tuple[int], optional
+        Subdivisions per quarter to evaluate.
+
+    Returns
+    -------
+    tuple[int, float]
+        `(best_subdivision, grid_ms)` where `grid_ms = quarter_ms / best_sub`.
+    """
+    vals = np.array([v for v in ioi_values_ms if v > 5.0])
+    if len(vals) == 0:
+        return 4, quarter_ms / 4.0
+
+    best_score, best_sub = -1.0, 4
+    for s in candidates:
+        grid = quarter_ms / s
+        ratios = vals / grid
+        # Keep fractional ratios in a sane range; do *not* filter <0.5 because
+        # coarse grids that produce tiny fractional ratios should be penalised.
+        valid_ratios = ratios[(ratios >= 0.1) & (ratios <= 32)]
+        if len(valid_ratios) == 0:
+            continue
+        residuals = np.abs(valid_ratios - np.round(valid_ratios))
+        frac_close = float(np.mean(residuals < 0.15))
+        prior = 1.0 if s in (4, 8, 16) else 0.9
+        score = frac_close * prior
+        if score > best_score:
+            best_score, best_sub = score, s
+
+    if best_score < 0.4:
+        best_sub = 4
+    return best_sub, quarter_ms / best_sub
+
+
+def local_expected_ms_for_ioi(tick2ms, ticks_per_quarter, start_tick, subdivision):
+    """Return the expected duration (ms) of one grid step starting at `start_tick`.
+
+    The duration is computed in tick-space then converted via the tempo map so
+    that tempo changes are honoured. This is the local "unit grid" against
+    which IOIs are expressed as integer multiples.
+
+    Parameters
+    ----------
+    tick2ms : callable
+        Tick→ms closure from `ticks_to_ms_function`.
+    ticks_per_quarter : int
+        PPQ resolution.
+    start_tick : int
+        Tick at which the previous note began (the IOI's origin).
+    subdivision : int
+        Number of grid steps per quarter note.
+
+    Returns
+    -------
+    float
+        Local grid duration in ms (clamped to ≥ 0.0001 to avoid div-by-zero).
+    """
+    ticks_per_sub = ticks_per_quarter / subdivision
+    return max(0.0001, tick2ms(start_tick + ticks_per_sub) - tick2ms(start_tick))
+
+
+# =============================================================================
+# Voice-aware IOI extraction
+# =============================================================================
+def compute_voice_iois(notes, tick2ms, min_ioi_ms=8.0,
+                      verbose=False, show_progress_bar=False):
+    """Group notes into monophonic voices and compute inter-onset intervals.
+
+    A *voice* is defined as the set of notes sharing the same
+    `(track, channel)` pair. Within each voice, notes are sorted by
+    `(start_tick, note)` and consecutive onset differences are recorded as
+    IOIs. IOIs shorter than `min_ioi_ms` (retriggers / within-chord) or
+    longer than 5000 ms (phrase boundaries) are discarded.
+
+    Parameters
+    ----------
+    notes : list[dict]
+        Note dictionaries with at least `start_tick`, `start_ms`, `track`,
+        and `channel` keys.
+    tick2ms : callable
+        Tick→ms closure (unused here but kept for API symmetry).
+    min_ioi_ms : float, default 8.0
+        Minimum IOI duration to retain.
+    verbose : bool, default False
+        If True, prints per-voice IOI counts.
+    show_progress_bar : bool, default False
+        Wrap the per-voice loop with a progress bar.
+
+    Returns
+    -------
+    dict[tuple[int,int], list[dict]]
+        Mapping `(track, channel) -> list[ioi_dict]`. Each `ioi_dict` has
+        `index_in_voice`, `ioi_ms`, `prev_note`, `cur_note`, `voice`.
+    """
+    voices = defaultdict(list)
+    for n in notes:
+        voices[(n['track'], n['channel'])].append(n)
+
+    voice_iois = {}
+    voice_iter = voices.items()
+    if show_progress_bar:
+        voice_iter = tqdm(voice_iter, desc="Extracting voice IOIs", leave=False)
+    for key, vnotes in voice_iter:
+        vnotes.sort(key=lambda x: (x['start_tick'], x['note']))
+        iois = []
+        for i in range(1, len(vnotes)):
+            prev, cur = vnotes[i - 1], vnotes[i]
+            ioi = cur['start_ms'] - prev['start_ms']
+            if ioi < min_ioi_ms or ioi > 5000.0:
+                continue
+            iois.append({
+                'index_in_voice': len(iois),
+                'ioi_ms': ioi,
+                'prev_note': prev,
+                'cur_note': cur,
+                'voice': key,
+            })
+        voice_iois[key] = iois
+        if verbose:
+            print(f"[voice {key}] {len(iois)} IOIs")
+    return voice_iois
+
+
+# =============================================================================
+# Residual-based anomaly detection (performance-adaptive)
+# =============================================================================
+def detect_anomalies_voice(voice_iois, tick2ms, ticks_per_quarter, subdivision,
+                          max_multiple=16,
+                          z_thresh=4.0,
+                          min_abs_for_z=35.0,
+                          jitter_abs_ms=40.0, jitter_rel=0.20,
+                          abs_dev_ms=50.0,
+                          verbose=False):
+    """Flag IOIs whose grid-residual is a statistical outlier for this voice.
+
+    For each IOI we compute the ratio between its measured duration and the
+    local grid step (`quarter_ms / subdivision`, evaluated at the IOI's
+    origin tick). Ratios outside `[0.75, max_multiple]` are skipped (grace
+    notes, long rests). The remaining residuals `ioi_ms - round(ratio) * grid`
+    form a per-voice distribution whose median and MAD are used as a
+    performance-adaptive baseline. An IOI is flagged if either:
+
+    * its residual is a strong z-outlier (`|z| > z_thresh` AND
+      `|residual| > min_abs_for_z` ms), **or**
+    * the local 8-IOI window shows sustained jitter (`std > jitter_abs_ms`
+      AND `std > jitter_rel * local_grid`) AND the residual magnitude
+      exceeds `abs_dev_ms`.
+
+    Parameters
+    ----------
+    voice_iois : list[dict]
+        IOI records for a single voice (output of `compute_voice_iois`).
+    tick2ms : callable
+        Tick→ms closure.
+    ticks_per_quarter : int
+        PPQ resolution.
+    subdivision : int
+        Estimated subdivisions per quarter (see `estimate_subdivision`).
+    max_multiple : int, default 16
+        Largest integer grid-multiple considered plausible.
+    z_thresh : float, default 4.0
+        Robust z-score threshold for outlier flagging.
+    min_abs_for_z : float, default 35.0
+        Minimum residual magnitude (ms) required to fire a z-outlier.
+    jitter_abs_ms : float, default 40.0
+        Absolute std threshold for the local-jitter test.
+    jitter_rel : float, default 0.20
+        Relative std threshold (`* local_grid`) for the local-jitter test.
+    abs_dev_ms : float, default 50.0
+        Minimum residual magnitude required when the local-jitter path fires.
+    verbose : bool, default False
+        If True, prints the per-voice robust statistics.
+
+    Returns
+    -------
+    tuple[list[dict], dict]
+        `(anomalies, thresholds)`. `anomalies` is the list of flagged IOI
+        records (augmented with `residual_ms`, `z`, `std_window`, `reasons`).
+        `thresholds` summarises the per-voice robust statistics and the
+        detection parameters used.
+    """
+    if not voice_iois:
+        return [], {}
+
+    # First pass: per-IOI ratio + residual
+    residuals = []
+    for ioi in voice_iois:
+        local_exp = local_expected_ms_for_ioi(
+            tick2ms, ticks_per_quarter, ioi['prev_note']['start_tick'], subdivision)
+        ratio = ioi['ioi_ms'] / local_exp if local_exp > 1e-6 else float('inf')
+        ioi['local_expected_ms'] = local_exp
+        ioi['ratio'] = ratio
+
+        # Skip extreme rests and very short ornaments (e.g. grace notes)
+        if ratio > max_multiple or ratio < 0.75:
+            ioi['flag'] = False
+            continue
+
+        nearest = max(1, int(round(ratio)))
+        ioi['nearest_int'] = nearest
+        ioi['residual_ms'] = ioi['ioi_ms'] - nearest * local_exp
+        residuals.append(ioi['residual_ms'])
+        ioi['flag'] = True
+
+    if not residuals:
+        return [], {}
+
+    med_res = stats.median(residuals)
+    mad_res = robust_mad(residuals)
+    if mad_res < 1.0:
+        mad_res = 1.0
+
+    # Second pass: apply outlier tests with an 8-IOI rolling window
+    anomalies, window = [], deque(maxlen=8)
+    for ioi in voice_iois:
+        if not ioi.get('flag', False):
+            continue
+        res = ioi['residual_ms']
+        local_exp = ioi['local_expected_ms']
+        window.append(res)
+        std_w = stats.pstdev(list(window)) if len(window) > 1 else 0.0
+        z = (res - med_res) / mad_res
+
+        reasons = []
+        if abs(z) > z_thresh and abs(res) > min_abs_for_z:
+            reasons.append('z_outlier')
+        if std_w > jitter_abs_ms and std_w > jitter_rel * local_exp:
+            reasons.append('local_jitter')
+
+        if 'z_outlier' in reasons or ('local_jitter' in reasons and abs(res) > abs_dev_ms):
+            ioi['reasons'] = reasons
+            ioi['z'] = z
+            ioi['std_window'] = std_w
+            anomalies.append(ioi)
+
+    thresholds = {
+        'z_thresh': z_thresh,
+        'min_abs_for_z': min_abs_for_z,
+        'jitter_abs_ms': jitter_abs_ms,
+        'jitter_rel': jitter_rel,
+        'abs_dev_ms': abs_dev_ms,
+        'med_residual': med_res,
+        'mad_residual': mad_res,
+        'n_iois_in_voice': len(voice_iois),
+    }
+    if verbose:
+        print(f"[voice] n={len(voice_iois)} med_res={med_res:.2f}ms "
+              f"mad_res={mad_res:.2f}ms flagged={len(anomalies)}")
+    return anomalies, thresholds
+
+
+# =============================================================================
+# Main analysis
+# =============================================================================
+def analyze_midi_timings(midi_path, max_subdivision=16,
+                         verbose=False, show_progress_bar=False):
+    """Parse a MIDI file and run voice-aware, grid-residual anomaly detection.
+
+    Pipeline:
+      1. Parse the MIDI file and build a tempo-aware `tick → ms` map.
+      2. Extract every `note` event into a normalised dict.
+      3. Group notes into `(track, channel)` voices and compute IOIs.
+      4. Estimate the dominant subdivision per quarter from the IOI
+         distribution.
+      5. Per voice, compute grid residuals and apply robust outlier tests.
+
+    Parameters
+    ----------
+    midi_path : str
+        Path to a `.mid` file.
+    max_subdivision : int, default 16
+        Upper bound on the integer grid-multiple considered plausible.
+    verbose : bool, default False
+        Propagated to tempo/voice/anomaly subroutines for diagnostic prints.
+    show_progress_bar : bool, default False
+        Propagated to subroutines; wraps loops with `tqdm` bars.
+
+    Returns
+    -------
+    dict or None
+        Analysis report. `None` if the file contains no notes. Keys include
+        `num_notes`, `num_iois`, `num_voices`, `estimated_subdivision`,
+        `expected_grid_ms_nominal`, IOI statistics, `anomalies_all`,
+        `anomalies_by_voice`, `thresholds_by_voice`, `voice_iois`, `notes`,
+        `tick2ms`, `ticks_per_quarter`, `tempo_changes`.
+    """
+    with open(midi_path, 'rb') as f:
+        score = MIDI.midi2score(f.read())
+
+    ticks_per_quarter = score[0]
+    tempo_changes = build_tempo_map(
+        score, verbose=verbose, show_progress_bar=show_progress_bar)
+    tick2ms = ticks_to_ms_function(tempo_changes, ticks_per_quarter)
+
+    # ----- Extract note events -----
+    notes = []
+    track_iter = range(1, len(score))
+    if show_progress_bar:
+        track_iter = tqdm(track_iter, desc="Extracting notes", leave=False)
+    for itrack in track_iter:
+        for ev in score[itrack]:
+            if ev[0] == 'note':
+                notes.append({
+                    'start_tick': ev[1],
+                    'start_ms':   tick2ms(ev[1]),
+                    'dur_tick':   ev[2],
+                    'channel':    ev[3],
+                    'note':        ev[4],
+                    'vel':         ev[5],
+                    'track':       itrack,
+                })
+    if not notes:
+        if verbose:
+            print("No notes found.")
+        return None
+
+    notes.sort(key=lambda x: (x['start_tick'], x['note']))
+    for n in notes:
+        n['duration_ms'] = (tick2ms(n['start_tick'] + n['dur_tick'])
+                            - tick2ms(n['start_tick']))
+
+    # ----- Voice IOIs -----
+    voice_iois = compute_voice_iois(
+        notes, tick2ms, min_ioi_ms=8.0,
+        verbose=verbose, show_progress_bar=show_progress_bar)
+
+    all_iois = [ioi['ioi_ms'] for v in voice_iois.values() for ioi in v]
+    quarter_ms = tempo_changes[0][1] / 1000.0
+    est_sub, expected_grid_ms = estimate_subdivision(all_iois, quarter_ms)
+    if verbose:
+        print(f"[grid] estimated subdivision/quarter = {est_sub} "
+              f"(grid = {expected_grid_ms:.3f} ms)")
+
+    # ----- Per-voice anomaly detection -----
+    anomalies_by_voice, thresholds_by_voice, all_anomalies = {}, {}, []
+    voice_iter = voice_iois.items()
+    if show_progress_bar:
+        voice_iter = tqdm(voice_iter, desc="Detecting anomalies", leave=False)
+    for voice, iois in voice_iter:
+        an, th = detect_anomalies_voice(
+            iois, tick2ms, ticks_per_quarter, est_sub,
+            max_multiple=max_subdivision, verbose=verbose)
+        anomalies_by_voice[voice] = an
+        thresholds_by_voice[voice] = th
+        all_anomalies.extend(an)
+
+    all_anomalies.sort(key=lambda a: abs(a['residual_ms']), reverse=True)
+
+    return {
+        'file': midi_path,
+        'num_notes': len(notes),
+        'num_iois': len(all_iois),
+        'num_voices': len(voice_iois),
+        'estimated_subdivision': est_sub,
+        'expected_grid_ms_nominal': expected_grid_ms,
+        'mean_ioi_ms':   stats.mean(all_iois)   if all_iois else 0.0,
+        'median_ioi_ms': stats.median(all_iois) if all_iois else 0.0,
+        'std_ioi_ms':    stats.pstdev(all_iois) if all_iois else 0.0,
+        'mad_ioi_ms':    robust_mad(all_iois),
+        'anomalies_all': all_anomalies,
+        'anomalies_by_voice': anomalies_by_voice,
+        'thresholds_by_voice': thresholds_by_voice,
+        'voice_iois': voice_iois,
+        'notes': notes,
+        'tick2ms': tick2ms,
+        'ticks_per_quarter': ticks_per_quarter,
+        'tempo_changes': tempo_changes,
+    }
+
+
+# =============================================================================
+# Reporting — text
+# =============================================================================
+def print_summary_report(report, top_n=20):
+    """Print the high-level summary block of a timing-analysis report.
+
+    Includes file path, note/voice/IOI counts, estimated subdivision, nominal
+    grid duration, IOI distribution statistics, and the total number of
+    flagged anomalies.
+
+    Parameters
+    ----------
+    report : dict
+        Report returned by `analyze_midi_timings`.
+    top_n : int, default 20
+        Maximum number of top anomalies to list (by |residual|).
+
+    Returns
+    -------
+    None
+    """
+    print("High-precision MIDI Timing Analysis (voice-aware, grid-residual)")
+    print("---------------------------------------------------------------")
+    print(f"File                         : {report['file']}")
+    print(f"Notes                        : {report['num_notes']}")
+    print(f"Voices (track,channel)       : {report['num_voices']}")
+    print(f"IOIs (voice-filtered)        : {report['num_iois']}")
+    print(f"Estimated subdivision/quarter: {report['estimated_subdivision']}")
+    print(f"Nominal grid (ms @ tick 0)   : {report['expected_grid_ms_nominal']:.3f}")
+    print(f"Mean IOI (ms)                : {report['mean_ioi_ms']:.3f}")
+    print(f"Median IOI (ms)              : {report['median_ioi_ms']:.3f}")
+    print(f"Std IOI (ms)                 : {report['std_ioi_ms']:.3f}")
+    print(f"MAD IOI (ms)                 : {report['mad_ioi_ms']:.3f}")
+    print(f"Flagged anomalies (total)    : {len(report['anomalies_all'])}")
+    print()
+
+
+def print_top_anomalies(report, top_n=20):
+    """Pretty-print the `top_n` most extreme flagged anomalies.
+
+    Each row shows the voice, measured IOI, local grid duration, integer
+    grid-multiple, signed residual, robust z-score, local jitter (std),
+    and the active reason tags.
+
+    Parameters
+    ----------
+    report : dict
+        Report returned by `analyze_midi_timings`.
+    top_n : int, default 20
+        Number of anomalies to print (sorted by |residual| descending).
+
+    Returns
+    -------
+    None
+    """
+    if not report['anomalies_all']:
+        print("No anomalies flagged. ✅")
+        return
+    print("Top anomalies (ranked by |residual|):")
+    print(f"{'voice':>10} {'ioi_ms':>9} {'grid_ms':>9} {'mult':>5} "
+          f"{'resid_ms':>9} {'z':>6} {'jitter':>7}  reasons")
+    for a in report['anomalies_all'][:top_n]:
+        print(f"{str(a['voice']):>10} {a['ioi_ms']:9.2f} "
+              f"{a['local_expected_ms']:9.2f} {a['nearest_int']:>5d} "
+              f"{a['residual_ms']:+9.2f} {a.get('z', 0):6.2f} "
+              f"{a.get('std_window', 0):7.2f}  {','.join(a['reasons'])}")
+
+
+def print_per_voice_report(report):
+    """Print a compact per-voice summary: IOI count, anomaly count, thresholds.
+
+    Parameters
+    ----------
+    report : dict
+        Report returned by `analyze_midi_timings`.
+
+    Returns
+    -------
+    None
+    """
+    print("\nPer-voice anomaly counts:")
+    print(f"{'voice':>10} {'#iois':>7} {'#anom':>6}  thresholds")
+    for voice, an in sorted(report['anomalies_by_voice'].items(),
+                            key=lambda kv: -len(kv[1])):
+        th = report['thresholds_by_voice'][voice]
+        n_iois = th.get('n_iois_in_voice', 0)
+        print(f"{str(voice):>10} {n_iois:>7d} {len(an):>6d}  "
+              f"z={th['z_thresh']:.1f} jit={th['jitter_abs_ms']:.0f}ms "
+              f"med_res={th['med_residual']:.1f}ms")
+
+
+# =============================================================================
+# Reporting — plot
+# =============================================================================
+def plot_timing_analysis(report, max_ioi_quantile=0.95, figsize=(15, 9)):
+    """Plot IOI timeline, local grid contour, and the residual anomaly signal.
+
+    Two stacked subplots:
+
+    * **Top — IOI timeline.** Each IOI is drawn as a scatter dot, coloured
+      by its `nearest_int` grid-multiple. The local grid duration is drawn
+      as a step line through every IOI (so tempo/rubato contour is visible).
+      Horizontal dashed reference lines mark `k * nominal_grid` for
+      k = 1..8 with inline labels. Flagged anomalies are overlaid as red
+      `x` markers.
+
+    * **Bottom — Residual signal.** The signed residual
+      `ioi_ms - nearest_int * local_grid` over time, with shaded ±z-threshold
+      bands derived from each voice's robust MAD. Anomalies are again marked
+      in red. This subplot makes the outlier logic visually self-evident.
+
+    Parameters
+    ----------
+    report : dict
+        Report returned by `analyze_midi_timings`.
+    max_ioi_quantile : float, default 0.95
+        Quantile of the IOI distribution used to set the top subplot's y-axis
+        upper bound (with 1.25× headroom).
+    figsize : tuple[float, float], default (15, 9)
+        Matplotlib figure size.
+
+    Returns
+    -------
+    matplotlib.figure.Figure
+        The created figure (also displayed inline in Jupyter).
+    """
+    g = report['expected_grid_ms_nominal']
+
+    # Flatten & time-sort IOIs across all voices
+    all_iois_flat = [ioi for v in report['voice_iois'].values() for ioi in v]
+    all_iois_flat.sort(key=lambda x: x['cur_note']['start_ms'])
+    if not all_iois_flat:
+        print("No IOIs to plot.")
+        return None
+
+    xs = np.array([ioi['cur_note']['start_ms'] / 1000.0 for ioi in all_iois_flat])
+    ys = np.array([ioi['ioi_ms'] for ioi in all_iois_flat])
+    mults = np.array([ioi.get('nearest_int', 0) for ioi in all_iois_flat])
+    grid_vals = np.array([ioi.get('local_expected_ms', g) for ioi in all_iois_flat])
+
+    # Anomalies
+    anom = report['anomalies_all']
+    anom_x = np.array([a['cur_note']['start_ms'] / 1000.0 for a in anom])
+    anom_y = np.array([a['ioi_ms'] for a in anom])
+    anom_r = np.array([a['residual_ms'] for a in anom])
+
+    # Residuals + threshold bands (use a single voice-wide MAD summary)
+    resids = np.array([ioi.get('residual_ms', 0.0) for ioi in all_iois_flat])
+    mads = [th['mad_residual'] for th in report['thresholds_by_voice'].values()
+            if th]
+    z_thr = next(iter(report['thresholds_by_voice'].values()))['z_thresh'] \
+            if report['thresholds_by_voice'] else 4.0
+    med_res = (stats.median([th['med_residual'] for th in
+                            report['thresholds_by_voice'].values() if th])
+               if mads else 0.0)
+    mad_res = max(stats.median(mads), 1.0) if mads else 1.0
+    band = z_thr * mad_res
+
+    # ----- Figure -----
+    fig, (ax_top, ax_bot) = plt.subplots(2, 1, figsize=figsize,
+                                         sharex=True, height_ratios=[2.5, 1])
+
+    # --- Top: IOI timeline ---
+    # Use scatter (no connecting lines) to avoid the previous "spaghetti"
+    scatter = ax_top.scatter(xs, ys, c=mults, cmap='viridis',
+                             s=18, alpha=0.7, label='IOI (colored by grid multiple)')
+    # Continuous local-grid step line through every IOI
+    ax_top.step(xs, grid_vals, where='post', color='C2', alpha=0.85,
+                linewidth=1.4, label='Local expected grid (per IOI)')
+    # Anomaly overlay
+    if len(anom_x):
+        ax_top.scatter(anom_x, anom_y, facecolors='none', edgecolors='red',
+                       s=90, linewidths=1.8, marker='o',
+                       label='Flagged anomalies', zorder=5)
+    # k * grid reference lines with labels
+    y_max_data = np.quantile(ys, max_ioi_quantile) if len(ys) else g * 8
+    y_max = max(g * 8.5, float(y_max_data) * 1.25)
+    for k in range(1, 9):
+        yk = k * g
+        if yk > y_max:
+            break
+        ax_top.axhline(yk, color='gray', alpha=0.25, linestyle='--', linewidth=0.8)
+        ax_top.text(xs[-1] * 0.995, yk, f' {k}×grid',
+                    va='center', ha='right', fontsize=8, color='dimgray')
+
+    ax_top.set_ylim(0, y_max)
+    ax_top.set_ylabel('IOI (ms)')
+    ax_top.set_title('MIDI IOIs with local-grid anomalies (voice-aware)')
+    ax_top.grid(alpha=0.25)
+    ax_top.legend(loc='upper right', fontsize=9)
+    cbar = fig.colorbar(scatter, ax=ax_top, pad=0.01)
+    cbar.set_label('Nearest grid multiple')
+
+    # --- Bottom: residual signal ---
+    ax_bot.axhline(0, color='black', linewidth=0.8, alpha=0.6)
+    ax_bot.fill_between(xs, med_res - band, med_res + band,
+                        color='red', alpha=0.10,
+                        label=f'±{z_thr:.0f}·MAD band (z-threshold)')
+    ax_bot.plot(xs, resids, color='C0', alpha=0.55, linewidth=0.9)
+    ax_bot.scatter(xs, resids, s=12, color='C0', alpha=0.7)
+    if len(anom_x):
+        ax_bot.scatter(anom_x, anom_r, color='red', s=55, marker='x',
+                       linewidths=1.8, label='Flagged anomalies', zorder=5)
+    ax_bot.set_xlabel('Time (seconds)')
+    ax_bot.set_ylabel('Residual (ms)')
+    ax_bot.set_title('Grid-residual signal (signed)')
+    ax_bot.grid(alpha=0.25)
+    ax_bot.legend(loc='upper right', fontsize=9)
+
+    fig.tight_layout()
+    plt.show()
+    return fig
+
+###################################################################################
+
 print('Module is loaded!')
 print('Enjoy! :)')
 print('=' * 70)
 
 ###################################################################################
-# This is the end of the midicap Python module
+# This is the end of the MIDI Ano Python module
 ###################################################################################
