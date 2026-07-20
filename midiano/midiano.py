@@ -59,7 +59,7 @@ import os
 import tqdm
 from sklearn.ensemble import IsolationForest
 from sklearn.preprocessing import StandardScaler
-import statistics as stats
+import statistics
 import matplotlib.pyplot as plt
 
 # Optional progress-bar dependency (graceful fallback)
@@ -1947,8 +1947,8 @@ def robust_mad(data):
     """
     if not data:
         return 0.0
-    med = stats.median(data)
-    return stats.median([abs(x - med) for x in data]) * 1.4826
+    med = statistics.median(data)
+    return statistics.median([abs(x - med) for x in data]) * 1.4826
 
 
 # =============================================================================
@@ -2176,7 +2176,7 @@ def detect_anomalies_voice(voice_iois, tick2ms, ticks_per_quarter, subdivision,
     if not residuals:
         return [], {}
 
-    med_res = stats.median(residuals)
+    med_res = statistics.median(residuals)
     mad_res = robust_mad(residuals)
     if mad_res < 1.0:
         mad_res = 1.0
@@ -2189,7 +2189,7 @@ def detect_anomalies_voice(voice_iois, tick2ms, ticks_per_quarter, subdivision,
         res = ioi['residual_ms']
         local_exp = ioi['local_expected_ms']
         window.append(res)
-        std_w = stats.pstdev(list(window)) if len(window) > 1 else 0.0
+        std_w = statistics.pstdev(list(window)) if len(window) > 1 else 0.0
         z = (res - med_res) / mad_res
 
         reasons = []
@@ -2324,9 +2324,9 @@ def analyze_midi_timings(midi_path, max_subdivision=16,
         'num_voices': len(voice_iois),
         'estimated_subdivision': est_sub,
         'expected_grid_ms_nominal': expected_grid_ms,
-        'mean_ioi_ms':   stats.mean(all_iois)   if all_iois else 0.0,
-        'median_ioi_ms': stats.median(all_iois) if all_iois else 0.0,
-        'std_ioi_ms':    stats.pstdev(all_iois) if all_iois else 0.0,
+        'mean_ioi_ms':   statistics.mean(all_iois)   if all_iois else 0.0,
+        'median_ioi_ms': statistics.median(all_iois) if all_iois else 0.0,
+        'std_ioi_ms':    statistics.pstdev(all_iois) if all_iois else 0.0,
         'mad_ioi_ms':    robust_mad(all_iois),
         'anomalies_all': all_anomalies,
         'anomalies_by_voice': anomalies_by_voice,
@@ -2491,10 +2491,10 @@ def plot_timing_analysis(report, max_ioi_quantile=0.95, figsize=(15, 9)):
             if th]
     z_thr = next(iter(report['thresholds_by_voice'].values()))['z_thresh'] \
             if report['thresholds_by_voice'] else 4.0
-    med_res = (stats.median([th['med_residual'] for th in
+    med_res = (statistics.median([th['med_residual'] for th in
                             report['thresholds_by_voice'].values() if th])
                if mads else 0.0)
-    mad_res = max(stats.median(mads), 1.0) if mads else 1.0
+    mad_res = max(statistics.median(mads), 1.0) if mads else 1.0
     band = z_thr * mad_res
 
     # ----- Figure -----
