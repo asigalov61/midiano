@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "midiano"
-version = "26.5.17"
+version = "26.7.20"
 description = "Comprehensive Python package for MIDI music anomalies detection and features analysis"
 license = "Apache-2.0"
 license-files = ["LICENSE"]
@@ -19,6 +19,7 @@ dependencies = [
   "tqdm",
   "scikit-learn",
   "scipy",
+  "matplotlib",
   "numpy==1.26.4"
 ]
 

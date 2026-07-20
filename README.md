@@ -298,6 +298,139 @@ for p in problems:
 
 ---
 
+### High-Precision Timing Anomaly Detector (`analyze_midi_timings`)
+
+While `MIDIProblemDetector` focuses on **structural corruption and rule-based quality issues**, the timing analyzer performs **voice-aware, grid-residual outlier detection** tailored to expressive human performances. It is robust to rubato, tempo changes, and graceful ornaments, and only flags IOIs whose residuals are strong statistical outliers relative to the performer's own baseline — without misclassifying musical expressivity as anomalies.
+
+```python
+from midiano import (
+    analyze_midi_timings,
+    print_summary_report,
+    print_top_anomalies,
+    print_per_voice_report,
+    plot_timing_analysis,
+)
+
+# Run analysis with progress bars and verbose diagnostics
+report = analyze_midi_timings(
+    "song.mid",
+    max_subdivision=16,
+    verbose=True,
+    show_progress_bar=True,
+)
+
+# Text reports
+print_summary_report(report)
+print_top_anomalies(report, top_n=20)
+print_per_voice_report(report)
+
+# Visual report (two stacked subplots)
+plot_timing_analysis(report)
+```
+
+**Function Signatures:**
+
+| Function | Description |
+|---|---|
+| `analyze_midi_timings(midi_path, max_subdivision=16, verbose=False, show_progress_bar=False)` | Parse MIDI and run voice-aware grid-residual anomaly detection. Returns a report dict. |
+| `print_summary_report(report, top_n=20)` | Print high-level summary (notes, voices, IOI stats, anomaly count). |
+| `print_top_anomalies(report, top_n=20)` | Print the most extreme flagged anomalies ranked by `|residual|`. |
+| `print_per_voice_report(report)` | Print per-voice anomaly counts and detection thresholds. |
+| `plot_timing_analysis(report, max_ioi_quantile=0.95, figsize=(15, 9))` | Plot the IOI timeline + residual signal with anomaly markers. Returns the matplotlib `Figure`. |
+
+**`analyze_midi_timings` Parameters:**
+
+| Parameter | Type | Default | Description |
+|---|---|---|---|
+| `midi_path` | `str` | required | Path to the `.mid` file. |
+| `max_subdivision` | `int` | `16` | Upper bound on the integer grid-multiple considered plausible. |
+| `verbose` | `bool` | `False` | If `True`, prints tempo-map, voice, and threshold diagnostics. |
+| `show_progress_bar` | `bool` | `False` | If `True`, wraps internal loops with `tqdm` progress bars. |
+
+**Report Dictionary Keys:**
+
+| Key | Type | Description |
+|---|---|---|
+| `file` | `str` | MIDI file path. |
+| `num_notes` | `int` | Total note count. |
+| `num_iois` | `int` | Voice-filtered IOI count. |
+| `num_voices` | `int` | Distinct `(track, channel)` voice count. |
+| `estimated_subdivision` | `int` | Estimated grid steps per quarter. |
+| `expected_grid_ms_nominal` | `float` | Nominal grid duration at the initial tempo (ms). |
+| `mean_ioi_ms` | `float` | Mean IOI across all voices. |
+| `median_ioi_ms` | `float` | Median IOI. |
+| `std_ioi_ms` | `float` | Population std-dev of IOIs. |
+| `mad_ioi_ms` | `float` | Robust MAD of IOIs. |
+| `anomalies_all` | `list[dict]` | All flagged anomalies, sorted by `|residual|` descending. |
+| `anomalies_by_voice` | `dict` | `{(track, channel): list[anomaly]}`. |
+| `thresholds_by_voice` | `dict` | `{(track, channel): thresholds}`. |
+| `voice_iois` | `dict` | `{(track, channel): list[ioi_record]}`. |
+| `notes` | `list[dict]` | All notes with computed `start_ms`, `duration_ms`. |
+| `tick2ms` | `callable` | Tick-to-ms closure honouring the tempo map. |
+| `ticks_per_quarter` | `int` | PPQ resolution from the file header. |
+| `tempo_changes` | `list[tuple]` | Sorted, de-duplicated `(tick, tempo_us)` pairs. |
+
+**Detection Logic:**
+
+Each IOI is expressed as `ratio = ioi_ms / local_grid_ms`, where the local grid is evaluated at the IOI's origin tick (so tempo changes are honoured). Ratios outside `[0.75, max_subdivision]` are skipped (grace notes, long rests). The remaining residuals:
+
+```
+residual_ms = ioi_ms - round(ratio) * local_grid_ms
+```
+
+form a per-voice distribution characterised by **median** and **MAD** (robust to expressive timing). An IOI is flagged if either test fires:
+
+| Test | Condition | Reason Tag |
+|---|---|---|
+| **z-outlier** | `|z| > z_thresh` AND `|residual| > min_abs_for_z` | `'z_outlier'` |
+| **local jitter** | rolling 8-IOI std exceeds both `jitter_abs_ms` and `jitter_rel × local_grid`, AND `|residual| > abs_dev_ms` | `'local_jitter'` |
+
+**Default thresholds:**
+
+| Parameter | Default | Description |
+|---|---|---|
+| `z_thresh` | `4.0` | Robust z-score threshold for outlier flagging. |
+| `min_abs_for_z` | `35.0` ms | Minimum residual magnitude required to fire a z-outlier. |
+| `jitter_abs_ms` | `40.0` ms | Absolute std threshold for the local-jitter test. |
+| `jitter_rel` | `0.20` | Relative std threshold (`× local_grid`). |
+| `abs_dev_ms` | `50.0` ms | Minimum residual magnitude required when the local-jitter path fires. |
+
+**Plot Interpretation (`plot_timing_analysis`):**
+
+The figure contains two stacked subplots sharing a time axis:
+
+* **Top — IOI timeline.** Each IOI is a scatter dot **colored by its nearest grid multiple** (`viridis` colormap with colorbar). The continuous local grid duration is drawn as a **step line through every IOI** (so tempo/rubato contour is visible). Horizontal dashed lines mark `k × nominal_grid` for `k = 1..8` with inline labels. Flagged anomalies are overlaid as **red open circles**.
+* **Bottom — Residual signal.** The signed residual `ioi_ms − nearest_int × local_grid` over time, with the **±z·MAD threshold band** shaded in red. Anomalies are marked with **red `x`** symbols. This subplot makes the detector's outlier logic visually self-evident.
+
+```python
+# Customize the plot
+fig = plot_timing_analysis(report, max_ioi_quantile=0.99, figsize=(16, 10))
+
+# Access flagged anomalies directly
+for a in report['anomalies_all'][:10]:
+    voice = a['voice']
+    print(f"{voice} ioi={a['ioi_ms']:.1f}ms grid={a['local_expected_ms']:.1f}ms "
+          f"mult={a['nearest_int']} resid={a['residual_ms']:+.1f}ms "
+          f"z={a.get('z', 0):.2f} reasons={a['reasons']}")
+
+# Iterate per-voice thresholds
+for voice, th in report['thresholds_by_voice'].items():
+    print(f"{voice}: med_res={th['med_residual']:.2f}ms "
+          f"mad_res={th['mad_residual']:.2f}ms n={th['n_iois_in_voice']}")
+```
+
+**Why this complements `MIDIProblemDetector`:**
+
+| Aspect | `MIDIProblemDetector` | `analyze_midi_timings` |
+|---|---|---|
+| **Goal** | Find encoding corruption and quality issues. | Find timing outliers in expressive performances. |
+| **Method** | Rule-based thresholds on aggregate features. | Per-voice robust statistics on grid residuals. |
+| **Output** | Categorical problem list (critical/warning/info). | Ranked anomaly records with residual/z/jitter values. |
+| **Sensitive to** | Malformed MIDI, missing metadata, encoding bugs. | Erratic timing, sustained local jitter, mistimed onsets. |
+| **Robust to** | Rubato, tempo changes, ornaments. | Same — performance-adaptive by design. |
+
+---
+
 ### Batch Processing
 
 ```python
